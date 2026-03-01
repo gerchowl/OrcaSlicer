@@ -339,6 +339,10 @@ SupportGeneratorLayersPtr generate_raft_base(
             new_layer.polygons = inflate_factor_1st_layer > 0 ? expand(first_layer, inflate_factor_1st_layer) : first_layer;
         }
         // Insert the base layers.
+        // Additional base layers (from additional_base_layers setting) use the
+        // expanded first-layer footprint; original base layers use the standard base.
+        size_t n_additional = object.config().additional_base_layers.value;
+        Polygons expanded_first_layer = raft_layers.front()->polygons;
         for (size_t i = 1; i < slicing_params.base_raft_layers; ++ i) {
             coordf_t print_z = raft_layers.back()->print_z;
             SupportGeneratorLayer &new_layer  = layer_storage.allocate_unguarded(SupporLayerType::RaftBase);
@@ -346,7 +350,9 @@ SupportGeneratorLayersPtr generate_raft_base(
             new_layer.print_z  = print_z + slicing_params.base_raft_layer_height;
             new_layer.height   = slicing_params.base_raft_layer_height;
             new_layer.bottom_z = print_z;
-            new_layer.polygons = base;
+            // Additional base layers share the expanded first-layer footprint
+            size_t original_base_count = slicing_params.base_raft_layers - n_additional;
+            new_layer.polygons = (i < original_base_count) ? base : expanded_first_layer;
         }
         // Insert the interface layers.
         for (size_t i = 1; i < slicing_params.interface_raft_layers; ++ i) {
@@ -391,6 +397,21 @@ SupportGeneratorLayersPtr generate_raft_base(
                 interfaces->polygons = diff(interfaces->polygons, brim);
             if (base_interfaces)
                 base_interfaces->polygons = diff(base_interfaces->polygons, brim);
+        }
+        // Add additional base layers for non-raft support (raft_layers == 0)
+        // These use the expanded first-layer footprint to match the foundation layer.
+        size_t additional = object.config().additional_base_layers.value;
+        if (additional > 0 && columns_base != nullptr && ! columns_base->polygons.empty()) {
+            coordf_t previous_z = columns_base->print_z;
+            for (size_t i = 0; i < additional; ++ i) {
+                SupportGeneratorLayer &new_layer = layer_storage.allocate(SupporLayerType::Base);
+                new_layer.print_z  = previous_z + slicing_params.layer_height;
+                new_layer.height   = slicing_params.layer_height;
+                new_layer.bottom_z = previous_z;
+                new_layer.polygons = columns_base->polygons;  // Use expanded footprint
+                raft_layers.push_back(&new_layer);
+                previous_z = new_layer.print_z;
+            }
         }
     }
 
@@ -1575,8 +1596,10 @@ void generate_support_toolpaths(
         {
             SupportLayer &support_layer = *support_layers[support_layer_id];
             LayerCache   &layer_cache   = layer_caches[support_layer_id];
-            const float   support_interface_angle = (support_params.support_style == smsGrid || config.support_interface_pattern == smipRectilinear) ?
-                support_params.interface_angle : support_params.raft_interface_angle(support_layer.interface_id());
+            const float   support_interface_angle = (config.support_interface_pattern == smipRectilinearInterlaced) ?
+                support_params.raft_interface_angle(support_layer.interface_id()) :
+                ((support_params.support_style == smsGrid || config.support_interface_pattern == smipRectilinear) ?
+                support_params.interface_angle : support_params.raft_interface_angle(support_layer.interface_id()));
 
             // Find polygons with the same print_z.
             SupportGeneratorLayerExtruded &bottom_contact_layer = layer_cache.bottom_contact_layer;
@@ -1730,8 +1753,11 @@ void generate_support_toolpaths(
                 bool  sheath  = support_params.with_sheath;
                 bool  no_sort = false;
                 bool  done    = false;
-                if (base_layer.layer->bottom_z < EPSILON) {
-                    // Base flange (the 1st layer).
+                if (base_layer.layer->bottom_z < EPSILON ||
+                    (! slicing_params.has_raft() && config.additional_base_layers.value > 0 &&
+                     base_layer.layer->print_z < slicing_params.first_print_layer_height +
+                         config.additional_base_layers.value * slicing_params.layer_height + EPSILON)) {
+                    // Base flange (the 1st layer or additional base layers).
                     filler = filler_first_layer;
                     filler->angle = Geometry::deg2rad(float(config.support_angle.value + 90.));
                     density = float(config.raft_first_layer_density.value * 0.01);
@@ -1743,8 +1769,10 @@ void generate_support_toolpaths(
                     filler->link_max_length = coord_t(scale_(filler->spacing * link_max_length_factor / density));
                     sheath  = true;
                     no_sort = true;
-                } else if (support_params.support_style == SupportMaterialStyle::smsTreeOrganic) {
-                    // if the tree supports are too tall, use double wall to make it stronger
+                } else if (support_params.support_style == SupportMaterialStyle::smsTreeOrganic &&
+                           (config.support_base_pattern == smpNone || config.support_base_pattern == smpDefault)) {
+                    // Orca: A special case for the hollow Organic supports
+                    // Orca: If the tree supports are too tall, use a double wall to make it stronger
                     SupportParameters support_params2 = support_params;
                     if (support_layer.print_z > 100.0)
                         support_params2.tree_branch_diameter_double_wall_area_scaled = 0.1;
